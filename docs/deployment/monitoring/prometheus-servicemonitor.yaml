@@ -1,0 +1,23 @@
+# ServiceMonitor for Prometheus Operator to scrape the kv-cache core library metrics.
+# Requires: prometheus-operator CRDs installed in the cluster.
+#
+# Adjust the selector to match the labels on the Service that fronts your kv-cache
+# deployment, and ensure the endpoint port name matches the metrics port (the
+# reference example serves /metrics on :8080).
+#
+# If not using the Prometheus Operator, add a scrape config to your prometheus.yml
+# instead (see prometheus.yaml in this directory).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kvcache-monitor
+  labels:
+    app: kvcache
+spec:
+  selector:
+    matchLabels:
+      app: kvcache
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
