@@ -112,7 +112,67 @@ Watch the Grafana dashboard — you should see KV offload metrics (throughput, t
 curl -s http://localhost:8000/metrics | grep kv_offload
 ```
 
-## 6. Cleanup
+## 6. Alerting Rules
+
+Default Prometheus alerting rules for the KV-cache metrics live alongside the
+monitoring manifests:
+
+| File | Use |
+|------|-----|
+| `monitoring/kvcache-alerts.rules.yml` | Canonical plain rules file (source of truth). |
+| `monitoring/prometheus-rules.yaml` | `PrometheusRule` CRD for prometheus-operator setups. |
+| `monitoring/kvcache-alerts.test.yaml` | `promtool` unit tests for the rules. |
+
+The bundled `monitoring/prometheus.yaml` already wires the rules in via
+`rule_files`, so applying it (step 2) loads the alerts automatically. Confirm
+they loaded:
+
+```bash
+# Prometheus UI -> Status -> Rules, or:
+curl -s http://localhost:9090/api/v1/rules | grep -o '"name":"[A-Za-z]*"'
+```
+
+The alerts cover:
+
+- **KVCacheLowIndexHitRatio** — index hit ratio below 30% while lookups are
+  happening (stale index / broken KV-events stream).
+- **KVCacheHighLookupLatency** — P99 `kvcache_index_lookup_latency_seconds`
+  above 500ms.
+- **KVCacheAbnormalEvictionSpike** — eviction rate jumps >5x its 1h baseline
+  (cache thrashing or repeated `AllBlocksCleared` resets).
+- **KVCacheHighTokenizationLatency** — P99 tokenization latency above 1s.
+- **VLLMHighRequestBacklog** / **VLLMHighTTFT** — optional vLLM-side saturation
+  alerts.
+
+> The `kvcache_*` series are exported by the kv-cache library — embedded in the
+> EPP (precise-prefix-cache-scorer with `enableMetrics: true`) or as a
+> standalone service — **not** by vLLM. Make sure Prometheus scrapes that
+> `/metrics` endpoint. A commented-out `kvcache` scrape job is included in
+> `prometheus.yaml` as a starting point. Thresholds are conservative defaults;
+> tune them to your workload before paging on them.
+
+### Using the Prometheus Operator instead
+
+If you run the prometheus-operator (e.g. kube-prometheus-stack), skip the
+`rule_files` wiring and apply the CRD instead. Adjust the `release` label in
+`prometheus-rules.yaml` to match your operator's `ruleSelector`:
+
+```bash
+kubectl apply -f docs/deployment/monitoring/prometheus-rules.yaml
+```
+
+### Validating the rules
+
+```bash
+cd docs/deployment/monitoring
+# Syntax check + unit tests (uses the promtool from the prometheus image):
+docker run --rm --entrypoint=/bin/promtool -v "$PWD":/work -w /work \
+  prom/prometheus:v2.53.0 check rules kvcache-alerts.rules.yml
+docker run --rm --entrypoint=/bin/promtool -v "$PWD":/work -w /work \
+  prom/prometheus:v2.53.0 test rules kvcache-alerts.test.yaml
+```
+
+## 7. Cleanup
 
 Remove all monitoring and vLLM resources:
 

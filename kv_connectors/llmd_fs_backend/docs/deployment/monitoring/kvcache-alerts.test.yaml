@@ -1,0 +1,201 @@
+# promtool unit tests for kvcache-alerts.rules.yml.
+#
+# Run from this directory:
+#   promtool test rules kvcache-alerts.test.yaml
+# or without a local promtool install:
+#   docker run --rm --entrypoint=/bin/promtool -v "$PWD":/work -w /work \
+#     prom/prometheus:v2.53.0 test rules kvcache-alerts.test.yaml
+rule_files:
+  - kvcache-alerts.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Low hit ratio under real traffic -> KVCacheLowIndexHitRatio fires.
+  - interval: 1m
+    input_series:
+      # 10 requests/min, 1 hit/min => 10% hit ratio, well under 30%.
+      - series: 'kvcache_index_lookup_requests_total'
+        values: '0+10x30'
+      - series: 'kvcache_index_lookup_hits_total'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: KVCacheLowIndexHitRatio
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: kvcache-index
+            exp_annotations:
+              summary: "KV-cache index hit ratio is low"
+              description: >-
+                KV-cache index hit ratio is 10% over the last 5m (threshold 30%)
+                while lookups are still happening. This often indicates a stale
+                index or a broken KV-events stream.
+
+  # Healthy hit ratio -> no alert. Also guards the low-traffic suppression path.
+  - interval: 1m
+    input_series:
+      - series: 'kvcache_index_lookup_requests_total'
+        values: '0+10x30'
+      - series: 'kvcache_index_lookup_hits_total'
+        values: '0+9x30'   # 90% hit ratio
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: KVCacheLowIndexHitRatio
+        exp_alerts: []
+
+  # No traffic: requests rate below the floor -> must not fire (no paging on an
+  # idle index).
+  - interval: 1m
+    input_series:
+      - series: 'kvcache_index_lookup_requests_total'
+        values: '0+0x30'
+      - series: 'kvcache_index_lookup_hits_total'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: KVCacheLowIndexHitRatio
+        exp_alerts: []
+
+  # High P99 lookup latency -> KVCacheHighLookupLatency fires.
+  # All observations land above 1s (> 0.5s threshold).
+  - interval: 1m
+    input_series:
+      - series: 'kvcache_index_lookup_latency_seconds_bucket{le="0.5"}'
+        values: '0+0x30'
+      - series: 'kvcache_index_lookup_latency_seconds_bucket{le="1"}'
+        values: '0+0x30'
+      - series: 'kvcache_index_lookup_latency_seconds_bucket{le="+Inf"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KVCacheHighLookupLatency
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: kvcache-index
+            exp_annotations:
+              summary: "KV-cache index P99 lookup latency is high"
+              description: >-
+                P99 KV-cache index lookup latency is 1s over the last 5m
+                (threshold 500ms).
+
+  # Low lookup latency -> no alert. Everything within the 0.1s bucket.
+  - interval: 1m
+    input_series:
+      - series: 'kvcache_index_lookup_latency_seconds_bucket{le="0.1"}'
+        values: '0+10x30'
+      - series: 'kvcache_index_lookup_latency_seconds_bucket{le="0.5"}'
+        values: '0+10x30'
+      - series: 'kvcache_index_lookup_latency_seconds_bucket{le="+Inf"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KVCacheHighLookupLatency
+        exp_alerts: []
+
+  # Eviction spike: long flat baseline (1/min) then a sharp jump to 600/min.
+  # The [5m] vs [1h] comparison fires while the spike is fresh (the 1h baseline
+  # catches up afterwards, which intentionally clears the alert). Evaluate ~11m
+  # into the spike, after the 10m "for" has elapsed.
+  - interval: 1m
+    input_series:
+      - series: 'kvcache_index_evictions_total'
+        values: '0+1x120 120+600x20'
+    alert_rule_test:
+      - eval_time: 132m
+        alertname: KVCacheAbnormalEvictionSpike
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: kvcache-index
+            exp_annotations:
+              summary: "KV-cache index eviction rate spike"
+              description: >-
+                KV-cache index eviction rate is 10/s over the last 5m, more than
+                5x its 1h baseline. Possible cache thrashing or repeated
+                AllBlocksCleared resets.
+
+  # Steady eviction rate -> no spike alert even though evictions are nonzero.
+  - interval: 1m
+    input_series:
+      - series: 'kvcache_index_evictions_total'
+        values: '0+120x100'   # constant 2/s
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: KVCacheAbnormalEvictionSpike
+        exp_alerts: []
+
+  # High tokenization P99 latency -> KVCacheHighTokenizationLatency fires,
+  # carrying the tokenizer label through.
+  - interval: 1m
+    input_series:
+      - series: 'kvcache_tokenization_tokenization_latency_seconds_bucket{le="1",tokenizer="Qwen/Qwen3-32B"}'
+        values: '0+0x30'
+      - series: 'kvcache_tokenization_tokenization_latency_seconds_bucket{le="2.5",tokenizer="Qwen/Qwen3-32B"}'
+        values: '0+10x30'
+      - series: 'kvcache_tokenization_tokenization_latency_seconds_bucket{le="+Inf",tokenizer="Qwen/Qwen3-32B"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KVCacheHighTokenizationLatency
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: kvcache-tokenization
+              tokenizer: "Qwen/Qwen3-32B"
+            exp_annotations:
+              summary: "KV-cache tokenization P99 latency is high"
+              description: >-
+                P99 tokenization latency for tokenizer "Qwen/Qwen3-32B" is 2.485s
+                over the last 5m (threshold 1s).
+
+  # vLLM request backlog over threshold -> VLLMHighRequestBacklog fires.
+  - interval: 1m
+    input_series:
+      - series: 'vllm:num_requests_waiting{model_name="Qwen/Qwen3-32B"}'
+        values: '100x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: VLLMHighRequestBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: vllm
+            exp_annotations:
+              summary: "vLLM request backlog is high"
+              description: >-
+                100 requests are waiting in the vLLM queue over the last 10m
+                (threshold 50). The serving tier may be saturated.
+
+  # vLLM backlog within bounds -> no alert.
+  - interval: 1m
+    input_series:
+      - series: 'vllm:num_requests_waiting{model_name="Qwen/Qwen3-32B"}'
+        values: '5x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: VLLMHighRequestBacklog
+        exp_alerts: []
+
+  # High vLLM TTFT P99 -> VLLMHighTTFT fires (all samples above 5s threshold).
+  - interval: 1m
+    input_series:
+      - series: 'vllm:time_to_first_token_seconds_bucket{le="5"}'
+        values: '0+0x30'
+      - series: 'vllm:time_to_first_token_seconds_bucket{le="10"}'
+        values: '0+10x30'
+      - series: 'vllm:time_to_first_token_seconds_bucket{le="+Inf"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: VLLMHighTTFT
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: vllm
+            exp_annotations:
+              summary: "vLLM P99 time-to-first-token is high"
+              description: >-
+                P99 time-to-first-token is 9.95s over the last 5m (threshold 5s).

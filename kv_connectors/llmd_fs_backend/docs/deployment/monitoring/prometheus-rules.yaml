@@ -1,0 +1,119 @@
+# PrometheusRule for prometheus-operator setups. Companion to
+# prometheus-servicemonitor.yaml. The `release` label selects which Prometheus
+# instance picks the rules up; adjust it to match your operator's ruleSelector
+# (e.g. the kube-prometheus-stack release name).
+#
+# Rule content is kept identical to kvcache-alerts.rules.yml — update both
+# together. If not using the operator, wire kvcache-alerts.rules.yml into your
+# prometheus.yml via `rule_files` instead (see prometheus.yaml).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kvcache-alerts
+  labels:
+    app: vllm-storage
+    release: prometheus
+spec:
+  groups:
+    - name: kvcache.index.rules
+      rules:
+        - alert: KVCacheLowIndexHitRatio
+          expr: |
+            (
+              sum(rate(kvcache_index_lookup_hits_total[5m]))
+              /
+              sum(rate(kvcache_index_lookup_requests_total[5m]))
+            ) < 0.3
+            and
+            sum(rate(kvcache_index_lookup_requests_total[5m])) > 0.1
+          for: 15m
+          labels:
+            severity: warning
+            component: kvcache-index
+          annotations:
+            summary: "KV-cache index hit ratio is low"
+            description: >-
+              KV-cache index hit ratio is {{ $value | humanizePercentage }} over the
+              last 5m (threshold 30%) while lookups are still happening. This often
+              indicates a stale index or a broken KV-events stream.
+
+        - alert: KVCacheHighLookupLatency
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le) (rate(kvcache_index_lookup_latency_seconds_bucket[5m]))
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            component: kvcache-index
+          annotations:
+            summary: "KV-cache index P99 lookup latency is high"
+            description: >-
+              P99 KV-cache index lookup latency is {{ $value | humanizeDuration }}
+              over the last 5m (threshold 500ms).
+
+        - alert: KVCacheAbnormalEvictionSpike
+          expr: |
+            rate(kvcache_index_evictions_total[5m])
+            > 5 * (rate(kvcache_index_evictions_total[1h]) + 0.001)
+            and
+            rate(kvcache_index_evictions_total[5m]) > 1
+          for: 10m
+          labels:
+            severity: warning
+            component: kvcache-index
+          annotations:
+            summary: "KV-cache index eviction rate spike"
+            description: >-
+              KV-cache index eviction rate is {{ $value | humanize }}/s over the
+              last 5m, more than 5x its 1h baseline. Possible cache thrashing or
+              repeated AllBlocksCleared resets.
+
+    - name: kvcache.tokenization.rules
+      rules:
+        - alert: KVCacheHighTokenizationLatency
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le, tokenizer) (rate(kvcache_tokenization_tokenization_latency_seconds_bucket[5m]))
+            ) > 1
+          for: 10m
+          labels:
+            severity: warning
+            component: kvcache-tokenization
+          annotations:
+            summary: "KV-cache tokenization P99 latency is high"
+            description: >-
+              P99 tokenization latency for tokenizer "{{ $labels.tokenizer }}" is
+              {{ $value | humanizeDuration }} over the last 5m (threshold 1s).
+
+    - name: kvcache.vllm.rules
+      rules:
+        - alert: VLLMHighRequestBacklog
+          expr: sum(vllm:num_requests_waiting) > 50
+          for: 10m
+          labels:
+            severity: warning
+            component: vllm
+          annotations:
+            summary: "vLLM request backlog is high"
+            description: >-
+              {{ $value | humanize }} requests are waiting in the vLLM queue over
+              the last 10m (threshold 50). The serving tier may be saturated.
+
+        - alert: VLLMHighTTFT
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m]))
+            ) > 5
+          for: 10m
+          labels:
+            severity: warning
+            component: vllm
+          annotations:
+            summary: "vLLM P99 time-to-first-token is high"
+            description: >-
+              P99 time-to-first-token is {{ $value | humanizeDuration }} over the
+              last 5m (threshold 5s).
