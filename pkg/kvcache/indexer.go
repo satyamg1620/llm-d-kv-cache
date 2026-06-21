@@ -248,6 +248,9 @@ func (k *Indexer) ScoreTokens(
 	)
 	defer span.End()
 
+	// Enrich the context logger with trace_id/span_id so the log lines below
+	// (block keys, pod scores) can be correlated with this span's trace.
+	ctx = telemetry.LoggerWithSpanContext(ctx, span)
 	traceLogger := log.FromContext(ctx).V(logging.TRACE).WithName("kvcache.ScoreTokens")
 
 	blockKeys, err := k.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, modelName, extraFeatures)
