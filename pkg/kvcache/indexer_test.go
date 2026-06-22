@@ -55,7 +55,9 @@ type mockTokenizersPool struct {
 	tokens []uint32
 }
 
-func (m *mockTokenizersPool) Tokenize(_ *types.RenderChatRequest, _ string) ([]uint32, *tokenization.MultiModalFeatures) {
+func (m *mockTokenizersPool) Tokenize(
+	_ context.Context, _ *types.RenderChatRequest, _ string,
+) ([]uint32, *tokenization.MultiModalFeatures) {
 	return m.tokens, nil
 }
 

@@ -151,7 +151,7 @@ func (k *Indexer) ComputeBlockKeys(ctx context.Context, renderReq *types.RenderC
 	}
 
 	// 1. tokenize prompt
-	tokens, features := k.tokenizersPool.Tokenize(renderReq, prompt)
+	tokens, features := k.tokenizersPool.Tokenize(ctx, renderReq, prompt)
 
 	// 2. Truncate prompt (if set in the request)
 	if renderReq != nil && renderReq.TruncatePromptTokens != nil {
@@ -207,7 +207,7 @@ func (k *Indexer) GetPodScores(ctx context.Context, renderReq *types.RenderChatR
 	}
 
 	// 1. tokenize prompt
-	tokens, features := k.tokenizersPool.Tokenize(renderReq, prompt)
+	tokens, features := k.tokenizersPool.Tokenize(ctx, renderReq, prompt)
 
 	// 2. Truncate prompt (if set in the request)
 	if renderReq != nil && renderReq.TruncatePromptTokens != nil {

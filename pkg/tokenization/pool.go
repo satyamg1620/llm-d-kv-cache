@@ -20,9 +20,13 @@ import (
 	"context"
 	"sync"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/llm-d/llm-d-kv-cache/pkg/telemetry"
 	types "github.com/llm-d/llm-d-kv-cache/pkg/tokenization/types"
 )
 
@@ -38,6 +42,10 @@ type tokenizationResponse struct {
 
 // Task represents a unit of work for tokenizing a prompt.
 type Task struct {
+	// Ctx carries the caller's trace context across the worker-queue boundary
+	// so the tokenization span is parented to the originating request span.
+	// A nil Ctx is treated as context.Background().
+	Ctx       context.Context
 	RenderReq *types.RenderChatRequest
 	Prompt    string
 	ModelName string
@@ -62,17 +70,23 @@ type Pool struct {
 
 // EnqueueTokenization enqueues a new tokenization task.
 // This method only enqueues the task and does not start processing it.
-func (pool *Pool) EnqueueTokenization(prompt string) {
+func (pool *Pool) EnqueueTokenization(ctx context.Context, prompt string) {
 	task := Task{
+		Ctx:    ctx,
 		Prompt: prompt,
 	}
 	pool.queue.Add(task)
 }
 
 // Tokenize queues a task and blocks until the final result is available.
-func (pool *Pool) Tokenize(renderReq *types.RenderChatRequest, prompt string) ([]uint32, *MultiModalFeatures) {
+// ctx is propagated to the worker so the tokenization span links to the
+// caller's request span.
+func (pool *Pool) Tokenize(
+	ctx context.Context, renderReq *types.RenderChatRequest, prompt string,
+) ([]uint32, *MultiModalFeatures) {
 	resultCh := make(chan tokenizationResponse, 1)
 	pool.queue.Add(Task{
+		Ctx:       ctx,
 		RenderReq: renderReq,
 		Prompt:    prompt,
 		ResultCh:  resultCh,
@@ -132,22 +146,50 @@ func (pool *Pool) workerLoop(_ int) {
 // processTask tokenizes the prompt and returns the tokens via ResultCh.
 // It sends exactly one response (success or error) if ResultCh is provided.
 func (pool *Pool) processTask(task Task) error {
+	// Resume the caller's trace context across the worker-queue boundary so the
+	// tokenization span is parented to the originating request span. When tracing
+	// is not configured, otel.Tracer() returns a no-op implementation.
+	ctx := task.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mode := "text"
+	if task.RenderReq != nil {
+		mode = "chat"
+	}
+	_, span := telemetry.Tracer("llm-d-kv-cache/pkg/tokenization").Start(
+		ctx, "llm_d.kv_cache.tokenization",
+		trace.WithSpanKind(trace.SpanKindInternal),
+	)
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("llm_d.kv_cache.tokenization.mode", mode),
+		attribute.Int("llm_d.kv_cache.tokenization.prompt_length", len(task.Prompt)),
+	)
+
 	var tokens []uint32
 	var features *MultiModalFeatures
 	var err error
 	if task.RenderReq == nil {
 		tokens, _, err = pool.tokenizer.Render(task.Prompt)
 		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			log.Log.Error(err, "failed to render tokens", "prompt", task.Prompt)
 			return err
 		}
 	} else {
 		tokens, features, err = pool.tokenizer.RenderChat(task.RenderReq)
 		if err != nil {
+			span.SetStatus(codes.Error, err.Error())
 			log.Log.Error(err, "failed to render tokens", "task", task.RenderReq)
 			return err
 		}
 	}
+
+	span.SetAttributes(
+		attribute.Int("llm_d.kv_cache.tokenization.token_count", len(tokens)),
+		attribute.Bool("llm_d.kv_cache.tokenization.multimodal", features != nil),
+	)
 
 	// On success, send the response if a channel is provided and close the channel.
 	if task.ResultCh != nil {
