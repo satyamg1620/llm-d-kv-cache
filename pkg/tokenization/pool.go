@@ -70,9 +70,8 @@ type Pool struct {
 
 // EnqueueTokenization enqueues a new tokenization task.
 // This method only enqueues the task and does not start processing it.
-func (pool *Pool) EnqueueTokenization(ctx context.Context, prompt string) {
+func (pool *Pool) EnqueueTokenization(prompt string) {
 	task := Task{
-		Ctx:    ctx,
 		Prompt: prompt,
 	}
 	pool.queue.Add(task)
@@ -148,14 +147,16 @@ func (pool *Pool) workerLoop(_ int) {
 func (pool *Pool) processTask(task Task) error {
 	// Resume the caller's trace context across the worker-queue boundary so the
 	// tokenization span is parented to the originating request span. When tracing
-	// is not configured, otel.Tracer() returns a no-op implementation.
+	// is not configured, telemetry.Tracer() returns a no-op implementation.
 	ctx := task.Ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	mode := "text"
+	promptLen := len(task.Prompt)
 	if task.RenderReq != nil {
 		mode = "chat"
+		promptLen = chatPromptLen(task.RenderReq)
 	}
 	_, span := telemetry.Tracer("llm-d-kv-cache/pkg/tokenization").Start(
 		ctx, "llm_d.kv_cache.tokenization",
@@ -164,7 +165,7 @@ func (pool *Pool) processTask(task Task) error {
 	defer span.End()
 	span.SetAttributes(
 		attribute.String("llm_d.kv_cache.tokenization.mode", mode),
-		attribute.Int("llm_d.kv_cache.tokenization.prompt_length", len(task.Prompt)),
+		attribute.Int("llm_d.kv_cache.tokenization.prompt_length", promptLen),
 	)
 
 	var tokens []uint32
@@ -202,6 +203,20 @@ func (pool *Pool) processTask(task Task) error {
 	}
 
 	return nil
+}
+
+// chatPromptLen returns the combined character length of the conversation's
+// text content. It is used as an approximate prompt size for chat-mode
+// tokenization spans, where task.Prompt is empty.
+func chatPromptLen(req *types.RenderChatRequest) int {
+	if req == nil {
+		return 0
+	}
+	total := 0
+	for _, msg := range req.Conversation {
+		total += len(msg.Content.PlainText())
+	}
+	return total
 }
 
 func (pool *Pool) SetTokenizer(tokenizer Tokenizer, modelName string) {

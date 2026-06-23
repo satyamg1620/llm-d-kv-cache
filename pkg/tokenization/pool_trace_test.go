@@ -66,7 +66,12 @@ func TestProcessTaskSpanChatModeAndMultimodal(t *testing.T) {
 	mockTokenizer := &MockTokenizer{}
 	pool := &Pool{modelName: "test-model", workers: 1, tokenizer: mockTokenizer}
 
-	renderReq := &types.RenderChatRequest{}
+	renderReq := &types.RenderChatRequest{
+		Conversation: []types.Conversation{
+			{Role: "system", Content: types.Content{Raw: "You are helpful."}},
+			{Role: "user", Content: types.Content{Raw: "Hello there!"}},
+		},
+	}
 	features := &MultiModalFeatures{MMHashes: map[string][]string{"image": {"abc"}}}
 	mockTokenizer.On("RenderChat", renderReq).Return([]uint32{1, 2}, features, nil)
 
@@ -76,6 +81,9 @@ func TestProcessTaskSpanChatModeAndMultimodal(t *testing.T) {
 	attrs := tokenizationSpanAttributes(span)
 	require.Equal(t, "chat", attrs["llm_d.kv_cache.tokenization.mode"].AsString())
 	require.True(t, attrs["llm_d.kv_cache.tokenization.multimodal"].AsBool())
+	// prompt_length reflects chat content length, not the empty task.Prompt.
+	require.Equal(t, int64(len("You are helpful.")+len("Hello there!")),
+		attrs["llm_d.kv_cache.tokenization.prompt_length"].AsInt64())
 	mockTokenizer.AssertExpectations(t)
 }
 
