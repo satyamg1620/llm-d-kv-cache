@@ -22,7 +22,6 @@ import (
 
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/metrics"
 	"github.com/llm-d/llm-d-kv-cache/pkg/utils/logging"
-	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -38,6 +37,8 @@ type subscriberEntry struct {
 	subscriber *zmqSubscriber
 	cancel     context.CancelFunc
 	endpoint   string
+	// done is closed once the subscriber's goroutine has returned.
+	done chan struct{}
 }
 
 // NewSubscriberManager creates a new subscriber manager.
@@ -73,6 +74,8 @@ func (sm *SubscriberManager) EnsureSubscriber(ctx context.Context, podIdentifier
 			"newEndpoint", endpoint)
 		entry.cancel()
 		delete(sm.subscribers, podIdentifier)
+		// The replacement subscriber below reuses podIdentifier, so its series
+		// are kept rather than cleaned up.
 	}
 
 	// Create new subscriber
@@ -81,13 +84,18 @@ func (sm *SubscriberManager) EnsureSubscriber(ctx context.Context, podIdentifier
 
 	// Create a context and start subscriber
 	subCtx, cancel := context.WithCancel(ctx)
-	go subscriber.Start(subCtx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		subscriber.Start(subCtx)
+	}()
 
 	// Update subscribers
 	sm.subscribers[podIdentifier] = &subscriberEntry{
 		subscriber: subscriber,
 		cancel:     cancel,
 		endpoint:   endpoint,
+		done:       done,
 	}
 	metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
 
@@ -112,15 +120,17 @@ func (sm *SubscriberManager) RemoveSubscriber(ctx context.Context, podIdentifier
 	entry.cancel()
 	delete(sm.subscribers, podIdentifier)
 	metrics.SubscriberActive.Set(float64(len(sm.subscribers)))
-	cleanupSubscriberMetrics(podIdentifier)
+	cleanupSubscriberMetrics(podIdentifier, entry.done)
 }
 
-// cleanupSubscriberMetrics removes the per-pod label series for a subscriber so
-// stale time series do not linger after a pod is removed.
-func cleanupSubscriberMetrics(podIdentifier string) {
-	metrics.SubscriberReconnections.DeleteLabelValues(podIdentifier)
-	metrics.MessagesReceived.DeleteLabelValues(podIdentifier)
-	metrics.ZMQErrors.DeletePartialMatch(prometheus.Labels{"pod_identifier": podIdentifier})
+// cleanupSubscriberMetrics drops the per-pod series for a removed subscriber
+// once its goroutine has exited. Cancellation is asynchronous, so cleaning up
+// eagerly would let a final message or error increment resurrect the series.
+func cleanupSubscriberMetrics(podIdentifier string, done <-chan struct{}) {
+	go func() {
+		<-done
+		metrics.CleanupSubscriber(podIdentifier)
+	}()
 }
 
 // Shutdown shuts down all subscribers.
@@ -134,7 +144,7 @@ func (sm *SubscriberManager) Shutdown(ctx context.Context) {
 	for podIdentifier, entry := range sm.subscribers {
 		debugLogger.Info("Shutting down subscriber", "podIdentifier", podIdentifier)
 		entry.cancel()
-		cleanupSubscriberMetrics(podIdentifier)
+		cleanupSubscriberMetrics(podIdentifier, entry.done)
 	}
 
 	sm.subscribers = make(map[string]*subscriberEntry)

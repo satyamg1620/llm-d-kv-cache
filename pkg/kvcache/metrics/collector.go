@@ -25,6 +25,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+// podIdentifierLabel is the label key carried by the per-pod kvevents metrics.
+// Keeping it as a constant localizes label-schema changes to this package.
+const podIdentifierLabel = "pod_identifier"
+
 var (
 	Admissions = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: "kvcache", Subsystem: "index", Name: "admissions_total",
@@ -89,30 +93,33 @@ var (
 		Help: "Block hashes forwarded for eviction after the KV-event dedup filter (block hashes, not BlockRemoved events)",
 	})
 
-	// SubscriberActive tracks the number of currently active ZMQ subscribers
-	// managed by the SubscriberManager.
+	// SubscriberActive tracks the number of ZMQ subscribers currently managed by
+	// the SubscriberManager. A subscriber is counted from creation until it is
+	// removed, so the gauge includes subscribers that are retrying a failed
+	// connection; it is a measure of intent, not of live connectivity. Pair it
+	// with SubscriberReconnections and ZMQErrors to spot unhealthy subscribers.
 	SubscriberActive = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: "kvcache", Subsystem: "kvevents", Name: "active_subscribers",
-		Help: "Number of currently active ZMQ subscribers",
+		Help: "Number of ZMQ subscribers currently managed, including those retrying a failed connection",
 	})
 	// SubscriberReconnections counts ZMQ subscriber reconnection attempts,
 	// labeled by the pod identifier the subscriber is bound to.
 	SubscriberReconnections = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "kvcache", Subsystem: "kvevents", Name: "subscriber_reconnections_total",
 		Help: "Total number of ZMQ subscriber reconnection attempts",
-	}, []string{"pod_identifier"})
+	}, []string{podIdentifierLabel})
 	// MessagesReceived counts raw messages received from ZMQ subscribers. The
 	// rate of message ingestion can be derived via rate() in Prometheus.
 	MessagesReceived = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "kvcache", Subsystem: "kvevents", Name: "messages_received_total",
 		Help: "Total number of messages received from ZMQ subscribers",
-	}, []string{"pod_identifier"})
+	}, []string{podIdentifierLabel})
 	// ZMQErrors counts errors encountered by ZMQ subscribers, labeled by the
 	// pod identifier and the operation that failed (e.g. "connect", "recv").
 	ZMQErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "kvcache", Subsystem: "kvevents", Name: "zmq_errors_total",
 		Help: "Total number of ZMQ subscriber errors",
-	}, []string{"pod_identifier", "operation"})
+	}, []string{podIdentifierLabel, "operation"})
 	// PoolQueueDepth tracks the total number of messages queued across all
 	// worker shards of the event processing pool.
 	PoolQueueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -137,6 +144,16 @@ func Collectors() []prometheus.Collector {
 		SubscriberActive, SubscriberReconnections, MessagesReceived, ZMQErrors,
 		PoolQueueDepth, PoolCapacity,
 	}
+}
+
+// CleanupSubscriber drops every per-pod kvevents series for podIdentifier so
+// stale time series do not linger after a subscriber is removed. Callers must
+// invoke it only once the subscriber's goroutine has exited, otherwise a late
+// increment resurrects the series.
+func CleanupSubscriber(podIdentifier string) {
+	SubscriberReconnections.DeleteLabelValues(podIdentifier)
+	MessagesReceived.DeleteLabelValues(podIdentifier)
+	ZMQErrors.DeletePartialMatch(prometheus.Labels{podIdentifierLabel: podIdentifier})
 }
 
 var registerMetricsOnce = sync.Once{}

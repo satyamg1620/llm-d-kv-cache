@@ -57,6 +57,13 @@ func newZMQSubscriber(pool *Pool, podIdentifier, endpoint, topicFilter string, r
 func (z *zmqSubscriber) Start(ctx context.Context) {
 	logger := log.FromContext(ctx).WithName("zmq-subscriber")
 
+	// A single timer is reused across retries to avoid allocating one per
+	// iteration of the reconnect loop. Go 1.23+ timer channels never deliver a
+	// stale value after Stop/Reset, so no draining is required.
+	retryTimer := time.NewTimer(retryInterval)
+	defer retryTimer.Stop()
+	retryTimer.Stop() // only start counting once a retry is actually pending
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -67,8 +74,9 @@ func (z *zmqSubscriber) Start(ctx context.Context) {
 			// setup/teardown and connection retries cleanly.
 			z.runSubscriber(ctx)
 			// wait before retrying, unless the context has been canceled.
+			retryTimer.Reset(retryInterval)
 			select {
-			case <-time.After(retryInterval):
+			case <-retryTimer.C:
 				metrics.SubscriberReconnections.WithLabelValues(z.podIdentifier).Inc()
 				logger.Info("retrying zmq-subscriber")
 			case <-ctx.Done():

@@ -114,6 +114,48 @@ func TestKVEventsMetricNames(t *testing.T) {
 	}
 }
 
+func TestCleanupSubscriberDropsPerPodSeries(t *testing.T) {
+	// Removing a subscriber must drop only its own series, leaving other pods'
+	// series intact.
+	SubscriberReconnections.WithLabelValues("pod-a").Inc()
+	MessagesReceived.WithLabelValues("pod-a").Inc()
+	ZMQErrors.WithLabelValues("pod-a", "recv").Inc()
+	ZMQErrors.WithLabelValues("pod-a", "connect").Inc()
+	SubscriberReconnections.WithLabelValues("pod-b").Inc()
+	MessagesReceived.WithLabelValues("pod-b").Inc()
+	ZMQErrors.WithLabelValues("pod-b", "recv").Inc()
+
+	CleanupSubscriber("pod-a")
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(SubscriberReconnections, MessagesReceived, ZMQErrors)
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather() failed: %v", err)
+	}
+
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == podIdentifierLabel && l.GetValue() == "pod-a" {
+					t.Errorf("metric %q still has a series for pod-a", mf.GetName())
+				}
+			}
+		}
+	}
+
+	// pod-b must be untouched: three series across the three metrics.
+	remaining := 0
+	for _, mf := range mfs {
+		remaining += len(mf.GetMetric())
+	}
+	if remaining != 3 {
+		t.Errorf("expected 3 remaining pod-b series, got %d", remaining)
+	}
+
+	CleanupSubscriber("pod-b")
+}
+
 func TestLogMetrics(t *testing.T) {
 	// Set up a buffer to capture log output
 	var buf bytes.Buffer

@@ -20,6 +20,7 @@ import (
 	"hash/fnv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -114,11 +115,19 @@ type Pool struct {
 	// Index.Add succeeds — both of which only the Pool observes.
 	dedup *eventDedupFilter
 	wg    sync.WaitGroup
+	// queueDepth mirrors the number of tasks queued across all shards. It is
+	// tracked incrementally rather than by summing queue.Len() so that the
+	// depth gauge stays O(1) on the enqueue/dequeue hot path.
+	queueDepth atomic.Int64
 }
 
 // NewPool creates a Pool with a sharded worker setup.
 // Subscribers are managed by SubscriberManager which is controlled by the pod
 // reconciler.
+//
+// Side effect: it registers the kvcache metrics with the controller-runtime
+// registry, mirroring kvblock.Index so that the kvevents metrics are scraped
+// wherever a pool runs. Registration is idempotent (guarded by a sync.Once).
 func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProcessor,
 	adapter EngineAdapter,
 ) *Pool {
@@ -140,21 +149,15 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		p.queues[i] = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*RawMessage]())
 	}
 
-	// Register kvevents metrics so the subscriber/pool subsystem is scraped
-	// whenever an event processing pool is created.
 	metrics.Register()
 
 	return p
 }
 
-// recordQueueDepth updates the pool queue depth gauge with the current total
-// number of messages queued across all worker shards.
-func (p *Pool) recordQueueDepth() {
-	total := 0
-	for _, queue := range p.queues {
-		total += queue.Len()
-	}
-	metrics.PoolQueueDepth.Set(float64(total))
+// addQueueDepth adjusts the tracked queue depth by delta and publishes the new
+// total to the depth gauge.
+func (p *Pool) addQueueDepth(delta int64) {
+	metrics.PoolQueueDepth.Set(float64(p.queueDepth.Add(delta)))
 }
 
 // GroupCatalog returns the KV cache group metadata learned from events.
@@ -187,6 +190,12 @@ func (p *Pool) Shutdown(ctx context.Context) {
 	}
 
 	p.wg.Wait()
+
+	// Tasks still queued at shutdown are dropped with the queues, so reset the
+	// depth rather than leaving the gauge pinned at the undrained count.
+	p.queueDepth.Store(0)
+	metrics.PoolQueueDepth.Set(0)
+
 	logger.Info("event processing pool shut down.")
 }
 
@@ -205,7 +214,7 @@ func (p *Pool) AddTask(task *RawMessage) {
 	//nolint:gosec // if concurrency overflows then the world is in trouble anyway
 	queueIndex := h.Sum32() % uint32(p.concurrency)
 	p.queues[queueIndex].Add(task)
-	p.recordQueueDepth()
+	p.addQueueDepth(1)
 }
 
 // worker is the main processing loop for a single worker goroutine.
@@ -226,7 +235,7 @@ func (p *Pool) worker(ctx context.Context, workerIndex int) {
 			// Task succeeded, remove it from the queue.
 			queue.Forget(task)
 		}(task)
-		p.recordQueueDepth()
+		p.addQueueDepth(-1)
 
 		// Check if context was cancelled after processing a task.
 		select {
