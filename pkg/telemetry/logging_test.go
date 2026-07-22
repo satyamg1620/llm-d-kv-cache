@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-kv-cache/pkg/telemetry"
@@ -80,7 +81,7 @@ func TestLoggerWithSpanContextNoopForInvalidSpan(t *testing.T) {
 	ctx := log.IntoContext(context.Background(), captureLogger(&logged))
 
 	// A span from the default no-op tracer has an invalid span context.
-	otel.SetTracerProvider(trace.NewNoopTracerProvider())
+	otel.SetTracerProvider(noop.NewTracerProvider())
 	ctx2, span := otel.Tracer("test").Start(ctx, "noop")
 	defer span.End()
 
